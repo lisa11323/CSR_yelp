@@ -1,0 +1,186 @@
+library(bestNormalize)
+library(dplyr)
+library(Hmisc)
+library(lavaan)
+library(ggplot2)
+library(psych)
+library(semTools)
+
+df <- read.csv("data.csv")
+
+names(df)
+
+# log transforms
+df$log_compliment_num <- log1p(df$compliment_num)
+df$log_social_feedback <- log1p(df$social_feedback)
+df$log_degree <- log1p(df$degree)
+df$log_elite_count <- log1p(df$elite_count)
+df$log_fans <- log1p(df$fans)
+df$log_review_count <- log1p(df$review_count)
+df$log_user_useful <- log1p(df$user_useful)
+
+# Yeo-Johnson transforms
+df$pagerank_yeo <- predict(yeojohnson(df$pagerank), df$pagerank)
+df$kcore_yeo <- predict(yeojohnson(df$kcore), df$kcore)
+
+
+df_scaled <- df %>% mutate(across(where(is.numeric), scale))
+
+
+cfa_model <- '
+  relational_lv =~ log_compliment_num + compliment_diversity + log_social_feedback
+  structural_lv =~ degree + pagerank_yeo + kcore_yeo
+  cognitive_lv  =~ narrativity_ad + semantic_similarity + concept_overlap
+
+'
+fit_cfa <- cfa(cfa_model, data = df_scaled, std.lv = TRUE, estimator = "MLR")
+summary(fit_cfa, standardized = TRUE, fit.measures = TRUE)
+loadings <- standardizedSolution(fit_cfa) %>%
+  filter(op == "=~") %>%
+  select(lhs, rhs, est.std)
+
+print(loadings)
+summary(fit_cfa, standardized = TRUE, fit.measures = TRUE)
+
+loadings <- standardizedSolution(fit_cfa) %>%
+  filter(op == "=~") %>%
+  select(lhs, rhs, est.std)
+
+print(loadings)
+
+
+
+# --- factor scores ---
+fscores <- lavPredict(fit_cfa, method = "regression")
+fscores <- as.data.frame(fscores)
+colnames(fscores) <- c("cognitive", "relational", "structural")
+df_scaled <- cbind(df_scaled, fscores)
+
+# --- interaction terms: fans ---
+df_scaled$int_relational_fans <- df_scaled$relational * df_scaled$log_fans
+df_scaled$int_structural_fans <- df_scaled$structural * df_scaled$log_fans
+df_scaled$int_cognitive_fans   <- df_scaled$cognitive  * df_scaled$log_fans
+
+# --- interaction terms: elite ---
+df_scaled$int_relational_elite <- df_scaled$relational * df_scaled$log_elite_count
+df_scaled$int_structural_elite <- df_scaled$structural * df_scaled$log_elite_count
+df_scaled$int_cognitive_elite   <- df_scaled$cognitive  * df_scaled$log_elite_count
+
+
+# reliability for latent constructs
+omega_rel <- suppressMessages(omega(df_scaled[, c("log_compliment_num", "compliment_diversity", "log_social_feedback")],
+                                    nfactors = 1, fm = "ml")$omega.tot)
+omega_str <- suppressMessages(omega(df_scaled[, c("degree", "pagerank_yeo", "kcore_yeo")],
+                                    nfactors = 1, fm = "ml")$omega.tot)
+omega_cog <- suppressMessages(omega(df_scaled[, c("narrativity_ad", "semantic_similarity", "concept_overlap")],
+                                    nfactors = 1, fm = "ml")$omega.tot)
+
+# finished variable construction
+vars_dual <- c("relational","structural","cognitive",
+               "log_elite_count","log_fans","log_user_useful", "log_review_count",
+               "int_relational_elite", "int_structural_elite", "int_cognitive_elite",
+               "int_relational_fans","int_structural_fans","int_cognitive_fans")
+
+omega_dual <- c(1, 1, #log_user_useful, log_review_count
+                omega_rel, omega_str, omega_cog,
+                1,1,   # log_elite_count, log_fans
+                1,1,1,   # elite interactions
+                1,1,1)   # fan interactions
+
+get_corrected_cov <- function(var_names, omega_values) {
+  Z <- df_scaled[, var_names]
+  S_raw <- cov(Z, use = "pairwise.complete.obs")
+  omega_mat <- diag(omega_values)
+  colnames(omega_mat) <- rownames(omega_mat) <- var_names
+  return(omega_mat %*% S_raw %*% omega_mat)
+}
+
+S_corrected_dual <- get_corrected_cov(vars_dual, omega_dual)
+
+
+model_mod_dual <- '
+  # DV1: log_review_count
+  log_review_count ~ relational + structural + cognitive +
+                     log_elite_count + log_fans + 
+                     int_relational_elite + int_structural_elite + int_cognitive_elite +
+                     int_relational_fans + int_structural_fans + int_cognitive_fans
+
+  # DV2: log_user_useful
+  log_user_useful ~ relational + structural + cognitive +
+                    log_elite_count + log_fans + 
+                    int_relational_elite + int_structural_elite + int_cognitive_elite +
+                    int_relational_fans + int_structural_fans + int_cognitive_fans
+'
+
+
+fit_dual <- sem(model_mod_dual,
+                sample.cov = S_corrected_dual,
+                sample.nobs = nrow(df_scaled),
+                meanstructure = FALSE, fixed.x = FALSE)
+summary(fit_dual, standardized = TRUE, fit.measures = TRUE)
+
+
+
+
+
+# Bootstrap
+
+set.seed(1234)
+fit_dual_boot <- sem(model_mod_dual,
+                     data = df_scaled[, vars_dual],
+                     se = "bootstrap", bootstrap = 5000)
+
+
+# conditional effect
+boot_mat <- parameterEstimates(fit_dual_boot,
+                               boot.ci.type = "perc",
+                               standardized = FALSE,
+                               level = 0.95,
+                               ci = TRUE,
+                               rsquare = FALSE)
+
+boot_mat <- as.data.frame(fit_dual_boot@boot$coef)
+colnames(boot_mat) <- names(coef(fit_dual_boot))
+
+calc_conditional_boot <- function(dv, sc, elite_level, fans_level) {
+  base  <- paste0(dv, "~", sc)
+  elite <- paste0(dv, "~int_", sc, "_elite")
+  fans  <- paste0(dv, "~int_", sc, "_fans")
+  
+  b <- boot_mat[, base]
+  i <- boot_mat[, elite]
+  j <- boot_mat[, fans]
+  
+  eff <- b + i * elite_level + j * fans_level
+  return(eff)
+}
+
+elite_levels <- c(-1, 1)
+fans_levels  <- c(-1, 1)
+
+results <- list()
+
+for (dv in c("log_user_useful","log_review_count")) {
+  for (sc in c("relational","structural", "cognitive")) {
+    for (e in elite_levels) {
+      for (f in fans_levels) {
+        eff <- calc_conditional_boot(dv, sc, e, f)
+        est <- mean(eff, na.rm=TRUE)
+        ci  <- quantile(eff, c(0.025,0.975), na.rm=TRUE)
+        
+        results[[length(results)+1]] <- data.frame(
+          DV = dv,
+          SC = sc,
+          Elite = e,
+          Fans = f,
+          Effect = round(est,3),
+          CI_lower = round(ci[1],3),
+          CI_upper = round(ci[2],3)
+        )
+      }
+    }
+  }
+}
+
+cond_boot_results <- do.call(rbind, results)
+print(cond_boot_results)
