@@ -1,0 +1,520 @@
+library(bestNormalize)
+library(dplyr)
+library(Hmisc)
+library(lavaan)
+library(ggplot2)
+library(psych)
+library(semTools)
+library(AER)
+library(Matrix)
+
+df <- read.csv("data_credence.csv")
+
+# 0. Pre-processing ============================================================
+id_var <- "user_id"
+if (id_var %in% names(df)) df[[id_var]] <- as.character(df[[id_var]])
+
+# Log-transforms
+df$log_compliment_num <- log1p(df$compliment_num)
+df$log_social_feedback <- log1p(df$social_feedback)
+df$log_degree <- log1p(df$degree)
+df$log_elite_count <- log1p(df$elite_count)
+df$log_fans <- log1p(df$fans)
+df$log_review_count <- log1p(df$review_count)
+df$log_user_useful <- log1p(df$user_useful)
+df$log_review_length <- log1p(df$review_length)
+df$log_tenure <- log1p(df$tenure)
+
+# Yeo-Johnson transforms
+df$pagerank_yeo <- predict(yeojohnson(df$pagerank), df$pagerank)
+df$kcore_yeo <- predict(yeojohnson(df$kcore), df$kcore)
+
+df_scaled <- df
+num_cols <- names(df_scaled)[sapply(df_scaled, is.numeric)]
+scale_cols <- setdiff(num_cols, id_var)
+df_scaled[scale_cols] <- lapply(df_scaled[scale_cols], function(x) as.numeric(scale(x)))
+
+
+# 1. Input variables ===========================================================
+vars_dv <- c("log_review_count", "log_user_useful")
+vars_mod <- c("log_elite_count", "log_fans")
+vars_ctrl <- c("log_tenure", "average_stars", "n_city")
+
+lv_final_names <- c("relational", "structural", "cognitive")
+lv_cfa_names <- c("rel_lv", "str_lv", "cog_lv")
+lv_map <- c(rel_lv = "relational", str_lv = "structural", cog_lv = "cognitive")
+
+make_pd <- function(S, eps = .Machine$double.eps^(3/4)) { S <- (S + t(S)) / 2; eig_min <- min(eigen(S, symmetric = TRUE, only.values = TRUE)$values); if (!is.finite(eig_min) || eig_min <= eps) { S <- as.matrix(nearPD(S, corr = FALSE, keepDiag = TRUE)$mat); S <- (S + t(S)) / 2 }; S }
+resid_center_cov <- function(S, z, x, ridge = 1e-8) { stopifnot(is.matrix(S)); stopifnot(!is.null(colnames(S)), !is.null(rownames(S))); stopifnot(identical(colnames(S), rownames(S))); allv <- colnames(S); if (!z %in% allv) stop("z not found in covariance matrix."); if (any(!x %in% allv)) stop("Some x not found in covariance matrix."); z_i <- match(z, allv); x_i <- match(x, allv); S_xx <- S[x_i, x_i, drop = FALSE]; S_xz <- S[x_i, z_i, drop = FALSE]; diag(S_xx) <- diag(S_xx) + ridge; b <- qr.solve(S_xx, S_xz); for (k in seq_along(allv)) { y_i <- k; S[z_i, y_i] <- S[z_i, y_i] - as.numeric(t(b) %*% S[x_i, y_i, drop = FALSE]); S[y_i, z_i] <- S[z_i, y_i] }; S[z_i, x_i] <- 0; S[x_i, z_i] <- 0; (S + t(S)) / 2 }
+to_num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+# Gaussian copula term
+copula_term <- function(x) { x <- as.numeric(x); ok <- is.finite(x); u <- rep(NA_real_, length(x)); r <- rank(x[ok], ties.method = "average"); n <- length(r); u[ok] <- (r - 0.5) / n; qnorm(u) }
+
+resid_center_one <- function(S, z, x, ridge = 1e-8) { stopifnot(identical(rownames(S), colnames(S))); allv <- colnames(S); if (!z %in% allv) stop("z not in S"); if (!x %in% allv) stop("x not in S"); z_i <- match(z, allv); x_i <- match(x, allv); S_xx <- matrix(S[x_i, x_i], 1, 1); S_xz <- matrix(S[x_i, z_i], 1, 1); S_xx[1,1] <- S_xx[1,1] + ridge; b <- as.numeric(S_xz / S_xx); for (k in seq_along(allv)) { S[z_i, k] <- S[z_i, k] - b * S[x_i, k]; S[k, z_i] <- S[z_i, k] }; S[z_i, x_i] <- 0; S[x_i, z_i] <- 0; (S + t(S)) / 2 }
+
+for (v in intersect(vars_ctrl, names(df_scaled))) df_scaled[[v]] <- to_num(df_scaled[[v]])
+
+# 2. CFA =======================================================================
+# 2-1) model
+cfa_model <- '
+  rel_lv =~ log_compliment_num + compliment_diversity + log_social_feedback
+  str_lv =~ degree + pagerank_yeo + kcore_yeo
+  cog_lv =~ narrativity + sem_align_global + concept_overlap_3 + log_review_length
+'
+fit_cfa <- cfa(model = cfa_model, data = df_scaled, estimator = "MLR", std.lv = TRUE, meanstructure = FALSE)
+summary(fit_cfa, fit.measures = TRUE, standardized = TRUE, rsquare = TRUE)
+
+# CR
+cr_out <- compRelSEM(fit_cfa)
+print(round(cr_out, 3))
+
+# AVE
+ave_out <- AVE(fit_cfa)
+print(round(ave_out, 3))
+
+
+# 2-2) prepare factor scores & croon ingredients
+FS_raw <- lavPredict(fit_cfa, method = "regression", fsm = TRUE)
+FSM <- attr(FS_raw, "fsm"); attr(FS_raw, "fsm") <- NULL
+if (is.list(FSM)) FSM <- FSM[[1]]
+FS_raw <- as.matrix(FS_raw)
+lv_names <- colnames(FS_raw)
+if (!all(lv_cfa_names %in% lv_names)) stop("Factor scores do not contain expected CFA latent names.")
+
+est_list <- lavInspect(fit_cfa, "est")
+LAMBDA <- est_list$lambda; THETA <- est_list$theta
+if (is.list(LAMBDA)) LAMBDA <- LAMBDA[[1]]
+if (is.list(THETA)) THETA <- THETA[[1]]
+if (is.null(rownames(LAMBDA)) || is.null(colnames(LAMBDA))) stop("LAMBDA has no dimnames.")
+if (is.null(rownames(THETA)) || is.null(colnames(THETA))) stop("THETA has no dimnames.")
+
+FSM0 <- FSM
+if (is.null(rownames(FSM0)) || is.null(colnames(FSM0))) stop("FSM has no dimnames.")
+
+if (all(lv_names %in% rownames(FSM0))) { FSM_use <- FSM0[lv_names, , drop = FALSE] } else if (all(lv_names %in% colnames(FSM0))) { FSM_use <- t(FSM0)[lv_names, , drop = FALSE] } else { stop("Cannot align FSM: latent names not found in rows or columns.") }
+
+obs_names <- colnames(FSM_use)
+if (any(!obs_names %in% rownames(THETA))) stop("FSM observed names not found in THETA.")
+if (any(!obs_names %in% rownames(LAMBDA))) stop("FSM observed names not found in LAMBDA rows.")
+if (any(!lv_names %in% colnames(LAMBDA))) stop("Latent names not found in LAMBDA columns.")
+
+THETA_use <- THETA[obs_names, obs_names, drop = FALSE]
+LAMBDA_use <- LAMBDA[obs_names, lv_names, drop = FALSE]
+
+offset <- FSM_use %*% THETA_use %*% t(FSM_use)
+scale <- FSM_use %*% LAMBDA_use
+offset <- (offset + t(offset)) / 2
+scale <- (scale + t(scale)) / 2
+scale_inv <- solve(scale)
+scale_inv <- (scale_inv + t(scale_inv)) / 2
+scoffset <- scale_inv %*% offset %*% scale_inv
+scoffset <- (scoffset + t(scoffset)) / 2
+dimnames(scoffset) <- list(lv_names, lv_names)
+
+FS_sc <- FS_raw %*% scale_inv
+colnames(FS_sc) <- lv_names
+colnames(FS_sc) <- unname(lv_map[colnames(FS_sc)])
+
+scoffset <- scoffset[lv_cfa_names, lv_cfa_names, drop = FALSE]
+dimnames(scoffset) <- list(unname(lv_map[lv_cfa_names]), unname(lv_map[lv_cfa_names]))
+
+
+# 2-3) impute variables
+df_work <- df_scaled
+df_work[, lv_final_names] <- FS_sc[, lv_final_names, drop = FALSE]
+
+core_base <- c(lv_final_names, vars_mod, vars_dv, vars_ctrl)
+miss_core <- setdiff(core_base, names(df_work))
+if (length(miss_core) > 0) stop(paste0("Missing core columns: ", paste(miss_core, collapse = ", ")))
+
+df_core <- df_work[complete.cases(df_work[, core_base]), , drop = FALSE]
+
+vars_base <- c(intersect(id_var, names(df_core)), lv_final_names, vars_mod, vars_dv, vars_ctrl)
+df_cc <- df_core[, vars_base, drop = FALSE]
+n_obs <- nrow(df_cc)
+
+# Gaussian copula terms
+df_cc$cop_elite <- copula_term(df_cc$log_elite_count)
+df_cc$cop_fans <- copula_term(df_cc$log_fans)
+vars_cop <- c("cop_elite", "cop_fans")
+
+# center moderators for interaction construction
+df_cc$log_elite_count <- as.numeric(scale(df_cc$log_elite_count, center = TRUE, scale = FALSE))
+df_cc$log_fans <- as.numeric(scale(df_cc$log_fans, center = TRUE, scale = FALSE))
+
+df_cc$int_relational_elite <- df_cc$relational * df_cc$log_elite_count
+df_cc$int_structural_elite <- df_cc$structural * df_cc$log_elite_count
+df_cc$int_cognitive_elite <- df_cc$cognitive * df_cc$log_elite_count
+df_cc$int_relational_fans <- df_cc$relational * df_cc$log_fans
+df_cc$int_structural_fans <- df_cc$structural * df_cc$log_fans
+df_cc$int_cognitive_fans <- df_cc$cognitive * df_cc$log_fans
+
+vars_int <- c("int_relational_elite","int_structural_elite","int_cognitive_elite","int_relational_fans","int_structural_fans","int_cognitive_fans")
+vars_dual <- c(lv_final_names, vars_mod, vars_dv, vars_int, vars_ctrl, vars_cop)
+
+# 2-4) build covariance & croon corrections
+Z <- df_cc[, vars_dual]
+S_raw <- cov(Z)
+S_corr <- S_raw
+
+lv_idx <- match(lv_final_names, vars_dual)
+S_corr[lv_idx, lv_idx] <- S_corr[lv_idx, lv_idx] - scoffset[lv_final_names, lv_final_names, drop = FALSE]
+
+int_map <- data.frame(int = vars_int, lv = c("relational","structural","cognitive","relational","structural","cognitive"), mod = c("log_elite_count","log_elite_count","log_elite_count","log_fans","log_fans","log_fans"), stringsAsFactors = FALSE)
+
+for (a in seq_len(nrow(int_map))) {
+  for (b in seq_len(nrow(int_map))) {
+    ia <- int_map$int[a]; ib <- int_map$int[b]
+    la <- int_map$lv[a]; lb <- int_map$lv[b]
+    ma <- int_map$mod[a]; mb <- int_map$mod[b]
+    ia_idx <- match(ia, vars_dual); ib_idx <- match(ib, vars_dual)
+    err_cov <- scoffset[la, lb] * S_corr[match(ma, vars_dual), match(mb, vars_dual)]
+    S_corr[ia_idx, ib_idx] <- S_corr[ia_idx, ib_idx] - err_cov
+  }
+}
+
+S_corr <- (S_corr + t(S_corr)) / 2
+colnames(S_corr) <- rownames(S_corr) <- vars_dual
+S_corr <- make_pd(S_corr)
+
+eps0 <- 1e-12
+key_vars <- unique(c(lv_final_names, vars_mod, vars_dv, vars_int, vars_cop))
+all_vars <- colnames(S_corr)
+zero_var <- names(which(diag(S_corr) <= eps0 | !is.finite(diag(S_corr))))
+bad_key <- intersect(zero_var, key_vars)
+if (length(bad_key) > 0) stop(paste0("Zero/neg variance in key vars: ", paste(bad_key, collapse = ", ")))
+
+drop_ok <- setdiff(zero_var, key_vars)
+if (length(drop_ok) > 0) {
+  keep <- setdiff(all_vars, drop_ok)
+  S_corr <- S_corr[keep, keep, drop = FALSE]
+  S_corr <- make_pd(S_corr)
+  vars_ctrl <- intersect(vars_ctrl, keep)
+  vars_cop <- intersect(vars_cop, keep)
+  vars_int <- intersect(vars_int, keep)
+  vars_mod <- intersect(vars_mod, keep)
+  vars_dv <- intersect(vars_dv, keep)
+  lv_final_names <- intersect(lv_final_names, keep)
+}
+
+# 2-5) residual centering for VIF
+S_corr <- resid_center_cov(S_corr, "int_relational_elite", c("relational","log_elite_count"))
+S_corr <- resid_center_cov(S_corr, "int_structural_elite", c("structural","log_elite_count"))
+S_corr <- resid_center_cov(S_corr, "int_cognitive_elite", c("cognitive","log_elite_count"))
+S_corr <- resid_center_cov(S_corr, "int_relational_fans", c("relational","log_fans"))
+S_corr <- resid_center_cov(S_corr, "int_structural_fans", c("structural","log_fans"))
+S_corr <- resid_center_cov(S_corr, "int_cognitive_fans", c("cognitive","log_fans"))
+S_corr <- make_pd(S_corr)
+
+S_corr <- resid_center_one(S_corr, "cop_elite", "log_elite_count")
+S_corr <- resid_center_one(S_corr, "cop_fans", "log_fans")
+S_corr <- make_pd(S_corr)
+
+
+# 3. Structural equation model =================================================
+vars_cop_now <- intersect(vars_cop, colnames(S_corr))
+if (length(vars_cop_now) == 0) stop("copula terms not found in S_corr.")
+
+rhs_terms <- unique(intersect(c(lv_final_names, vars_mod, vars_int, vars_ctrl, vars_cop_now), colnames(S_corr)))
+rhs_terms_base <- setdiff(rhs_terms, vars_cop_now)
+
+rhs_str_cop  <- paste(rhs_terms,      collapse = " + ")
+rhs_str_base <- paste(rhs_terms_base, collapse = " + ")
+zero_cop_str <- paste0("0*", vars_cop_now, collapse = " + ")
+
+model_mod_dual_base <- paste0("log_review_count ~ ", rhs_str_base, " + ", zero_cop_str, "\n", "log_user_useful ~ ", rhs_str_base, " + ", zero_cop_str)
+model_mod_dual_cop  <- paste0("log_review_count ~ ", rhs_str_cop, "\n", "log_user_useful ~ ", rhs_str_cop)
+
+fit_dual_croon_int <- sem(model = model_mod_dual_base, sample.cov = S_corr, sample.nobs = n_obs, meanstructure = FALSE, fixed.x = FALSE)
+fit_dual_croon_cop_rc <- sem(model = model_mod_dual_cop, sample.cov = S_corr, sample.nobs = n_obs, meanstructure = FALSE, fixed.x = FALSE)
+
+summary(fit_dual_croon_int, fit.measures = TRUE, standardized = TRUE, rsquare = TRUE)
+summary(fit_dual_croon_cop_rc, fit.measures = TRUE, standardized = TRUE, rsquare = TRUE)
+
+measures <- c("npar","df","chisq","pvalue","cfi","tli","rmsea","srmr","aic","bic")
+
+get_measures_safe <- function(fit, measures) {
+  out <- setNames(rep(NA_real_, length(measures)), measures)
+  for (m in measures) {
+    out[m] <- suppressWarnings(as.numeric(tryCatch(fitMeasures(fit, m), error = function(e) NA_real_)))
+  }
+  out
+}
+
+fit_row <- function(fit, label, measures) {
+  v <- get_measures_safe(fit, measures)
+  data.frame(model = label, as.list(v), check.names = FALSE, stringsAsFactors = FALSE)
+}
+
+fit_tbl <- rbind(
+  fit_row(fit_dual_croon_int,    "Baseline (Croon, no copula paths)", measures),
+  fit_row(fit_dual_croon_cop_rc, "Croon + copula",                    measures)
+)
+
+print(fit_tbl, row.names = FALSE)
+print(lavTestLRT(fit_dual_croon_int, fit_dual_croon_cop_rc))
+
+pe_cop <- parameterEstimates(fit_dual_croon_cop_rc, standardized = TRUE)
+cop_sig <- pe_cop[pe_cop$op == "~" & pe_cop$rhs %in% vars_cop_now, c("lhs","rhs","est","se","z","pvalue","std.all")]
+print(cop_sig, row.names = FALSE)
+
+
+
+# 4. Diagnostics ===============================================================
+check_pd_info <- function(S, name = "S", tol = 1e-12) {
+  S <- (S + t(S)) / 2
+  ev <- eigen(S, symmetric = TRUE, only.values = TRUE)$values
+  data.frame(
+    name = name,
+    ok = is.finite(min(ev)) && min(ev) > tol,
+    min_eigen = min(ev),
+    n_eigen_le_tol = sum(ev <= tol),
+    tol = tol,
+    stringsAsFactors = FALSE
+  )
+}
+
+get_model_fit_stats <- function(fit, tag) {
+  fm <- fitMeasures(fit, c("npar","df","chisq","pvalue","cfi","tli","rmsea","srmr","aic","bic"))
+  data.frame(model = tag, t(fm), row.names = NULL, check.names = FALSE)
+}
+
+get_coef_table <- function(fit, tag) {
+  pe <- parameterEstimates(fit, standardized = TRUE)
+  out <- pe[pe$op == "~", c("lhs","rhs","est","se","z","pvalue","std.all")]
+  out$model <- tag
+  out
+}
+
+wide_compare <- function(df) {
+  df$key <- paste(df$lhs, df$rhs, sep = " <- ")
+  base <- df[df$model == "Baseline", c("key","est","se","pvalue","std.all")]
+  cop  <- df[df$model == "Copula",   c("key","est","se","pvalue","std.all")]
+  names(base) <- c("key","est_base","se_base","p_base","std_base")
+  names(cop)  <- c("key","est_cop","se_cop","p_cop","std_cop")
+  m <- merge(base, cop, by = "key", all = TRUE)
+  m$delta_est <- m$est_cop - m$est_base
+  m$delta_std <- m$std_cop - m$std_base
+  m[order(m$key), ]
+}
+
+summarize_copula_terms <- function(fit, vars_cop) {
+  pe <- parameterEstimates(fit, standardized = TRUE)
+  out <- pe[pe$op == "~" & pe$rhs %in% vars_cop, c("lhs","rhs","est","se","z","pvalue","std.all")]
+  out[order(out$lhs, out$rhs), , drop = FALSE]
+}
+
+skew_kurt <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n < 4) return(c(n = n, mean = NA_real_, sd = NA_real_, skew = NA_real_, kurt = NA_real_))
+  m <- mean(x)
+  s <- sd(x)
+  if (!is.finite(s) || s <= 0) return(c(n = n, mean = m, sd = s, skew = NA_real_, kurt = NA_real_))
+  z <- (x - m) / s
+  c(n = n, mean = m, sd = s, skew = mean(z^3), kurt = mean(z^4) - 3)
+}
+
+desc_dist <- function(df, vars) {
+  vars <- intersect(vars, names(df))
+  if (length(vars) == 0) return(NULL)
+  out <- t(sapply(vars, function(v) skew_kurt(df[[v]])))
+  out <- data.frame(var = rownames(out), out, row.names = NULL, check.names = FALSE)
+  out
+}
+
+corr_table <- function(df, vars, use = "pairwise.complete.obs") {
+  vars <- intersect(vars, names(df))
+  if (length(vars) < 2) return(NULL)
+  suppressWarnings(cor(df[, vars, drop = FALSE], use = use))
+}
+
+vif_from_cov <- function(S, z, X, ridge = 1e-8) {
+  stopifnot(identical(rownames(S), colnames(S)))
+  allv <- colnames(S)
+  if (!z %in% allv) stop("z not found in covariance matrix.")
+  if (any(!X %in% allv)) stop("Some X not found in covariance matrix.")
+  z_i <- match(z, allv)
+  X_i <- match(X, allv)
+  S_xx <- S[X_i, X_i, drop = FALSE]
+  S_xz <- S[X_i, z_i, drop = FALSE]
+  varz <- as.numeric(S[z_i, z_i])
+  diag(S_xx) <- diag(S_xx) + ridge
+  r2 <- as.numeric(t(S_xz) %*% qr.solve(S_xx, S_xz)) / varz
+  r2 <- max(min(r2, 0.999999), 0)
+  vif <- 1 / (1 - r2)
+  c(R2 = r2, VIF = vif)
+}
+
+vif_table_from_cov <- function(S, rhs_terms, ridge = 1e-8) {
+  rhs_terms_now <- unique(intersect(rhs_terms, colnames(S)))
+  out <- data.frame(var = rhs_terms_now, R2 = NA_real_, VIF = NA_real_, stringsAsFactors = FALSE)
+  for (i in seq_along(rhs_terms_now)) {
+    z <- rhs_terms_now[i]
+    X <- setdiff(rhs_terms_now, z)
+    v <- vif_from_cov(S, z, X, ridge = ridge)
+    out$R2[i] <- v["R2"]
+    out$VIF[i] <- v["VIF"]
+  }
+  out[order(-out$VIF), , drop = FALSE]
+}
+
+cat("\n4-1) Copula condition diagnostics\n")
+dist_tbl <- desc_dist(df_cc, unique(c(vars_mod, vars_cop_now)))
+if (!is.null(dist_tbl)) {
+  print(dist_tbl, row.names = FALSE)
+  cat("\nFlag strong non-normality (|skew|>1 OR kurtosis>3):\n")
+  flag_tbl <- dist_tbl
+  flag_tbl$flag <- (abs(flag_tbl$skew) > 1) | (flag_tbl$kurt > 3)
+  print(flag_tbl[, c("var","skew","kurt","flag")], row.names = FALSE)
+}
+C_mod_cop <- corr_table(df_cc, unique(c(vars_mod, vars_cop_now)))
+if (!is.null(C_mod_cop)) {
+  cat("\nCorrelations among moderators and copula terms (df_cc):\n")
+  print(round(C_mod_cop, 3))
+}
+
+cat("\n4-2) Positive-definiteness (PD) checks for covariance matrices\n")
+print(check_pd_info(S_raw, "S_raw", tol = 1e-12), row.names = FALSE)
+print(check_pd_info(S_corr, "S_corr", tol = 1e-12), row.names = FALSE)
+
+cat("\n4-3) Fit baseline (Croon, no copula paths) and copula model (nested comparison)\n")
+
+rhs_terms_now <- unique(intersect(rhs_terms, colnames(S_corr)))
+rhs_terms_now <- unique(c(rhs_terms_now, vars_cop_now))
+rhs_terms_base <- setdiff(rhs_terms_now, vars_cop_now)
+
+rhs_str_base <- paste(rhs_terms_base, collapse = " + ")
+rhs_str_cop  <- paste(rhs_terms_now,  collapse = " + ")
+zero_cop_str <- paste0("0*", vars_cop_now, collapse = " + ")
+
+model_base <- paste0("log_review_count ~ ", rhs_str_base, " + ", zero_cop_str, "\n", "log_user_useful ~ ", rhs_str_base, " + ", zero_cop_str)
+model_cop  <- paste0("log_review_count ~ ", rhs_str_cop, "\n", "log_user_useful ~ ", rhs_str_cop)
+
+fit_dual_croon_int <- sem(model = model_base, sample.cov = S_corr, sample.nobs = n_obs, meanstructure = FALSE, fixed.x = FALSE)
+fit_dual_croon_cop_rc <- sem(model = model_cop,  sample.cov = S_corr, sample.nobs = n_obs, meanstructure = FALSE, fixed.x = FALSE)
+
+fit_stats <- rbind(get_model_fit_stats(fit_dual_croon_int, "Baseline"), get_model_fit_stats(fit_dual_croon_cop_rc, "Copula"))
+print(fit_stats, row.names = FALSE)
+
+cat("\n4-4) Nested LRT (baseline nested in copula):\n")
+print(lavTestLRT(fit_dual_croon_int, fit_dual_croon_cop_rc))
+
+cat("\n4-5) Copula term significance\n")
+print(summarize_copula_terms(fit_dual_croon_cop_rc, vars_cop_now), row.names = FALSE)
+
+cat("\n4-6) Coefficient comparison baseline vs copula (delta)\n")
+coef_base <- get_coef_table(fit_dual_croon_int, "Baseline")
+coef_cop  <- get_coef_table(fit_dual_croon_cop_rc, "Copula")
+coef_all <- rbind(coef_base, coef_cop)
+
+rhs_keep <- unique(c(lv_final_names, vars_mod, vars_int, vars_ctrl, vars_cop_now))
+coef_key <- coef_all[coef_all$rhs %in% rhs_keep, , drop = FALSE]
+cmp_tbl <- wide_compare(coef_key)
+print(cmp_tbl[order(cmp_tbl$key), ], row.names = FALSE)
+
+cat("\n4-7) Croon correction sanity\n")
+if (all(lv_final_names %in% colnames(S_raw)) && all(lv_final_names %in% colnames(S_corr))) {
+  raw_lv <- S_raw[lv_final_names, lv_final_names, drop = FALSE]
+  cor_lv <- S_corr[lv_final_names, lv_final_names, drop = FALSE]
+  
+  d_raw <- diag(raw_lv)
+  d_cor <- diag(cor_lv)
+  
+  cat("Latent variances summary (Raw): min=", min(d_raw, na.rm=TRUE), " max=", max(d_raw, na.rm=TRUE), " n<=0=", sum(d_raw<=0, na.rm=TRUE), "\n")
+  cat("Latent variances summary (Croon-corrected): min=", min(d_cor, na.rm=TRUE), " max=", max(d_cor, na.rm=TRUE), " n<=0=", sum(d_cor<=0, na.rm=TRUE), "\n")
+  
+  bad <- which(is.finite(d_cor) & d_cor <= 0)
+  if (length(bad) > 0) {
+    cat("Warning: non-positive latent variances after Croon correction:\n")
+    print(data.frame(lv = names(d_cor)[bad], var = as.numeric(d_cor[bad]), row.names = NULL), row.names = FALSE)
+  }
+  
+  print(check_pd_info(raw_lv, "S_raw latent block", tol = 1e-12), row.names = FALSE)
+  print(check_pd_info(cor_lv, "S_corr latent block", tol = 1e-12), row.names = FALSE)
+}
+
+cat("\n4-8) VIF (multicollinearity)\n")
+vif_tbl <- vif_table_from_cov(S_corr, rhs_terms_now, ridge = 1e-8)
+print(vif_tbl, row.names = FALSE)
+cat("\nMax VIF:", max(vif_tbl$VIF, na.rm = TRUE), "\n")
+
+
+
+
+# 5. Bootstrap =================================================================
+orth_int <- function(dat, int_name, x1, x2) {
+  f <- as.formula(paste0(int_name, " ~ ", x1, " + ", x2))
+  dat[[int_name]] <- as.numeric(residuals(lm(f, data = dat)))
+  dat
+}
+
+orth_one <- function(dat, z_name, x_name) {
+  f <- as.formula(paste0(z_name, " ~ ", x_name))
+  dat[[z_name]] <- as.numeric(residuals(lm(f, data = dat)))
+  dat
+}
+
+df_boot <- df_cc[, vars_dual, drop = FALSE]
+
+df_boot <- orth_int(df_boot, "int_relational_elite", "relational", "log_elite_count")
+df_boot <- orth_int(df_boot, "int_structural_elite", "structural", "log_elite_count")
+df_boot <- orth_int(df_boot, "int_cognitive_elite",  "cognitive",  "log_elite_count")
+df_boot <- orth_int(df_boot, "int_relational_fans",  "relational", "log_fans")
+df_boot <- orth_int(df_boot, "int_structural_fans",  "structural", "log_fans")
+df_boot <- orth_int(df_boot, "int_cognitive_fans",   "cognitive",  "log_fans")
+
+df_boot <- orth_one(df_boot, "cop_elite", "log_elite_count")
+df_boot <- orth_one(df_boot, "cop_fans",  "log_fans")
+
+set.seed(1234)
+fit_dual_boot <- sem(
+  model = model_mod_dual_cop,
+  data = df_boot,
+  se = "bootstrap",
+  bootstrap = 5000,
+  meanstructure = FALSE,
+  fixed.x = FALSE
+)
+
+boot_mat <- as.data.frame(fit_dual_boot@boot$coef)
+colnames(boot_mat) <- names(coef(fit_dual_boot))
+
+calc_conditional_boot <- function(dv, sc, elite_level, fans_level, B) {
+  base_nm  <- paste0(dv, "~", sc)
+  elite_nm <- paste0(dv, "~int_", sc, "_elite")
+  fans_nm  <- paste0(dv, "~int_", sc, "_fans")
+  b <- B[, base_nm]
+  i <- B[, elite_nm]
+  j <- B[, fans_nm]
+  b + i * elite_level + j * fans_level
+}
+
+elite_levels <- c(-1, 1)
+fans_levels  <- c(-1, 1)
+
+results <- list()
+for (dv in vars_dv) {
+  for (sc in lv_final_names) {
+    for (e in elite_levels) {
+      for (f in fans_levels) {
+        eff <- calc_conditional_boot(dv, sc, e, f, boot_mat)
+        est <- mean(eff, na.rm = TRUE)
+        ci  <- quantile(eff, c(0.025, 0.975), na.rm = TRUE)
+        results[[length(results) + 1]] <- data.frame(
+          DV = dv,
+          SC = sc,
+          Elite = e,
+          Fans = f,
+          Effect = round(est, 3),
+          CI_lower = round(ci[1], 3),
+          CI_upper = round(ci[2], 3)
+        )
+      }
+    }
+  }
+}
+
+cond_boot_results <- do.call(rbind, results)
+print(cond_boot_results)
